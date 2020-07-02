@@ -6,12 +6,6 @@
 #pragma comment(lib, "Ws2_32")
 #include <string.h>
 
-enum {
-    HTTP_INVALID_METHOD,
-    HTTP_GET,
-    HTTP_POST
-};
-
 #define METHOD_MAX_LENGTH 16
 #define URI_MAX_LENGTH 255
 #define VERSION_MAX_LENGTH 8
@@ -24,11 +18,18 @@ char* BAD_REQUEST_DEFAULT = "400 Bad Request\r\n";
 char* NOT_FOUND_REQUEST_DEFAULT = "404 Not Found\r\n";
 char* CONTENT_TYPE_HTTP = "text/html";
 
+enum {
+    HTTP_INVALID_METHOD,
+    HTTP_GET
+};
+
 struct http_request_s {
     unsigned char method;
     char uri[URI_MAX_LENGTH];
 };
+
 typedef struct http_request_s http_request_t;
+
 struct http_response_s {
     int response_code;
     char* response_message;
@@ -36,7 +37,17 @@ struct http_response_s {
     int response_length;
     char* response_content;
 };
+
 typedef struct http_response_s http_response_t;
+
+struct settings_s {
+    unsigned short port;
+    unsigned char verbose;
+};
+
+typedef struct settings_s settings_t;
+
+settings_t* settings;
 
 void net_init_winsock() {
     WSADATA wsaData;
@@ -65,8 +76,14 @@ SOCKET net_create_and_bind_sock() {
     hints.ai_protocol = IPPROTO_TCP;
     hints.ai_flags = AI_PASSIVE;
 
+    char port_to_string_buf[6] = {};
+    sprintf_s(port_to_string_buf, 6, "%d", settings->port);
+    if(settings->verbose) {
+        printf("Creating socket on port %s\n", port_to_string_buf);
+    }
+
     // Resolve the local address and port to be used by the server
-    int iResult = getaddrinfo(NULL, "80", &hints, &result);
+    int iResult = getaddrinfo(NULL, port_to_string_buf, &hints, &result);
     if (iResult != 0) {
         printf("getaddrinfo failed: %d\n", iResult);
         WSACleanup();
@@ -124,8 +141,6 @@ http_request_t* http_parse_request(char* buffer, size_t buflen) {
         sscanf(buffer, "%s", &method);
         if(strcmp(method, "GET")) {
             r_method = HTTP_GET;
-        } else if (strcmp(method, "POST")) {
-            r_method = HTTP_POST;
         }
         
     }
@@ -150,7 +165,6 @@ http_request_t* http_parse_request(char* buffer, size_t buflen) {
     memset(request->uri, 0, URI_MAX_LENGTH);
     memcpy(&request->uri, r_uri, URI_MAX_LENGTH);
     request->uri[URI_MAX_LENGTH-1] = '\0';
-    printf("%s\n", request->uri);
 
     return request;
 }
@@ -203,13 +217,13 @@ http_response_t* http_generate_normal_response(http_request_t* request) {
     fseek(file, 0, SEEK_SET);
     http_response_t* response = malloc(sizeof(http_response_t));
     if(strstr(uri, ".html") || strstr(uri, ".htm")) {
-        response->content_type = "text/html";
+        response->content_type = "text/html; charset=utf-8";
     } else if(strstr(uri, ".png")) {
         response->content_type = "image/png";
     } else if (strstr(uri, ".ico")) {
         response->content_type = "image/x-icon";
     } else {
-        response->content_type = "text/plain";
+        response->content_type = "text/plain; charset=utf-8";
     }
     char* content = malloc(file_length+1);
     content[file_length] = '\0';
@@ -223,8 +237,11 @@ http_response_t* http_generate_normal_response(http_request_t* request) {
 }
 
 void* http_encode_response(http_response_t* response, int* bytes) {
-    void* packet = malloc(response->response_length+128);
-    *bytes = sprintf(packet, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", response->response_code, response->response_message, response->content_type, response->response_length-1, response->response_content);
+    void* packet = malloc(response->response_length+256);
+    *bytes += sprintf_s(packet, 256, "HTTP/1.1 %d %s\r\nServer: tinyhttpd\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+                      response->response_code, response->response_message, response->content_type, response->response_length-1);
+    memcpy((packet+*bytes), response->response_content, response->response_length);
+    *bytes += response->response_length;
     return packet;
 }
 
@@ -252,12 +269,10 @@ void net_handle_connections(SOCKET server_sock) {
         WSAAddressToStringA(&client_data, size, NULL, addr_string, (LPDWORD)&len);
         printf("Connection from %s\n", addr_string);
         int iResult = recv(ClientSock, recvbuf, recvbuflen, 0);
-        printf("Bytes received: %d\n", iResult);
         http_request_t* request = NULL;
         request = http_parse_request(recvbuf, iResult);
         http_response_t* response;
         if(request == NULL) {
-            printf("null request\n");
             response = http_generate_bad_request_response();
         } else {
             response = http_generate_normal_response(request);
@@ -279,9 +294,66 @@ void net_handle_connections(SOCKET server_sock) {
     }
 }
 
-int main(void) {
-    printf("httpd\n");
+void settings_set_defaults(settings_t* settings) {
+    settings->port = 80;
+    settings->verbose = 0;
+}
+
+void settings_print_help() {
+    printf("tinyhttpd help\n");
+    printf("-h    --help        View command line arguments and usage.\n");
+    printf("-v    --verbose     Enable additional logging.\n");
+    printf("--port=[port]       Set port to listen on. Default: 80.\n");
+    exit(1);
+}
+
+unsigned short settings_parse_port(char* argument) {
+    int length = strlen(argument);
+    if(length < 8) {
+        return 0;
+    }
+    argument += 7;
+    unsigned short port;
+    if(!sscanf(argument, "%hu", &port)) {
+        return 0;
+    } else {
+        return port;
+    }
+}
+
+settings_t* settings_parse_argv(int argc, char* argv[]) {
+    settings_t* settings = malloc(sizeof(settings_t));
+    settings_set_defaults(settings);
+    for(;argc > 1;argc--) {
+        if(strcmp("-h",argv[argc-1]) == 0 || strcmp("--help",argv[argc-1]) == 0) {
+            settings_print_help();
+        } else if(strcmp("-v",argv[argc-1]) == 0 || strcmp("--verbose",argv[argc-1]) == 0)  {
+            settings->verbose = 1;
+        } else if(strstr(argv[argc-1],"--port=")) {
+            unsigned short port = settings_parse_port(argv[argc-1]);
+            if(!port) {
+                printf("Bad command line option %s.\n", argv[argc-1]);
+                settings_print_help();
+            }
+            settings->port = port;
+        } else {
+            printf("Unknown command line option %s.\n", argv[argc-1]);
+            settings_print_help();
+        }
+    }
+    return settings;
+}
+
+int main(int argc, char *argv[]) {
+    settings = settings_parse_argv(argc, argv);
+    printf("tinyhttpd 1.0\n");
+    if(settings->verbose) {
+        printf("Verbose logging enabled.\n");
+    }
     net_init_winsock();
     SOCKET sock = net_create_and_bind_sock();
+    if(settings->verbose) {
+        printf("Ready to accept connections.\n");
+    }
     net_handle_connections(sock);
 }
