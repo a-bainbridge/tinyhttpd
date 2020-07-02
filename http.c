@@ -147,7 +147,9 @@ http_request_t* http_parse_request(char* buffer, size_t buflen) {
         sscanf(uri_start, "%s", r_uri);
     }
     bp++;
+    memset(request->uri, 0, URI_MAX_LENGTH);
     memcpy(&request->uri, r_uri, URI_MAX_LENGTH);
+    request->uri[URI_MAX_LENGTH-1] = '\0';
     printf("%s\n", request->uri);
 
     return request;
